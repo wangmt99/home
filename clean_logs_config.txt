@@ -1,0 +1,5 @@
+export CLEAN_LOG_DIRS="/was/profiles/wdpt/logs/server1 /home/nlp/log /home/nlp/logs"
+export CLEAN_KEEP_DAYS=15
+export CLEAN_EXCLUDE_PATTERNS="*.log.swp *log.owner"
+export CLEAN_LOG_FILE="/home/nlp/SH_ALL/clean_logs_history.log"
+export CLEAN_LOG_PATTERNS="SystemOut_*.log SystemErr_*.log *.log.*"

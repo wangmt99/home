@@ -1,0 +1,273 @@
+#!/bin/bash
+
+SCRIPT_NAME=$(basename "$0")
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+DEFAULT_LOG_DIRS=()
+DEFAULT_KEEP_DAYS=7
+DEFAULT_EXCLUDE_PATTERNS=("*.keep" "*_important.log" "*_backup_*.log")
+DEFAULT_LOG_FILE="${SCRIPT_DIR}/clean_logs_history.log"
+DEFAULT_LOG_PATTERNS=("*.log" "*.log.*" "*.out" "*.txt")
+
+show_usage() {
+    echo "Usage: $SCRIPT_NAME [OPTIONS]"
+    echo "定期清理备份日志文件"
+    echo
+    echo "Options:"
+    echo "  -d, --dirs <dirs>      指定要清理的目录，多个目录用逗号分隔"
+    echo "                         示例: /var/log,/backup/logs"
+    echo "  -k, --keep-days <days> 指定保留天数，删除多少天之前的文件 (默认: ${DEFAULT_KEEP_DAYS})"
+    echo "  -e, --exclude <patterns> 排除的文件模式，多个模式用逗号分隔"
+    echo "                         示例: *.keep,*_important.log"
+    echo "  -p, --patterns <patterns> 要清理的文件匹配模式，多个模式用逗号分隔"
+    echo "                         示例: *.log,*.out,*.txt (默认: ${DEFAULT_LOG_PATTERNS[*]})"
+    echo "  -l, --log-file <file>  操作记录日志文件路径 (默认: ${DEFAULT_LOG_FILE})"
+    echo "  -n, --dry-run          模拟运行，不实际删除文件"
+    echo "  -v, --verbose          显示详细信息"
+    echo "  -h, --help             显示此帮助信息"
+    echo
+    echo "环境变量配置:"
+    echo "  CLEAN_LOG_DIRS         要清理的目录列表，用空格分隔"
+    echo "  CLEAN_KEEP_DAYS        保留天数"
+    echo "  CLEAN_EXCLUDE_PATTERNS 排除模式列表，用空格分隔"
+    echo "  CLEAN_LOG_FILE         操作记录日志文件"
+    echo "  CLEAN_LOG_PATTERNS     文件匹配模式列表，用空格分隔"
+}
+
+log_message() {
+    local level="$1"
+    shift
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local message="$*"
+    
+    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    
+    if [ "$VERBOSE" = "true" ]; then
+        echo "[$timestamp] [$level] $message"
+    fi
+}
+
+log_info() {
+    log_message "INFO" "$*"
+}
+
+log_warn() {
+    log_message "WARN" "$*"
+}
+
+log_error() {
+    log_message "ERROR" "$*"
+}
+
+log_delete() {
+    log_message "DELETE" "$*"
+}
+
+format_file_size() {
+    local size=$1
+    local unit="B"
+    
+    if [ "$size" -ge 1073741824 ]; then
+        local gb=$((size / 1073741824))
+        local remainder=$((size % 1073741824))
+        local fraction=$((remainder * 100 / 1073741824))
+        if [ "$fraction" -gt 0 ]; then
+            size="${gb}.${fraction}"
+        else
+            size="${gb}"
+        fi
+        unit="GB"
+    elif [ "$size" -ge 1048576 ]; then
+        local mb=$((size / 1048576))
+        local remainder=$((size % 1048576))
+        local fraction=$((remainder * 100 / 1048576))
+        if [ "$fraction" -gt 0 ]; then
+            size="${mb}.${fraction}"
+        else
+            size="${mb}"
+        fi
+        unit="MB"
+    elif [ "$size" -ge 1024 ]; then
+        local kb=$((size / 1024))
+        local remainder=$((size % 1024))
+        local fraction=$((remainder * 100 / 1024))
+        if [ "$fraction" -gt 0 ]; then
+            size="${kb}.${fraction}"
+        else
+            size="${kb}"
+        fi
+        unit="KB"
+    fi
+    
+    echo "${size}${unit}"
+}
+
+clean_directory() {
+    local dir="$1"
+    local days="$2"
+    local patterns_name="$3"
+    local exclude_name="$4"
+    local dry_run="$5"
+    
+    if [ ! -d "$dir" ]; then
+        log_warn "目录不存在: $dir"
+        return 1
+    fi
+    
+    log_info "开始清理目录: $dir (保留${days}天内的文件)"
+    
+    local delete_count=0
+    local total_size=0
+    
+    eval "local patterns=(\"\${${patterns_name}[@]}\")"
+    eval "local exclude_patterns=(\"\${${exclude_name}[@]}\")"
+    
+    local find_cmd="find \"$dir\" -type f -mtime \"+$days\" \\("
+    local first_pattern=true
+    
+    for pattern in "${patterns[@]}"; do
+        if $first_pattern; then
+            find_cmd="$find_cmd -name \"$pattern\""
+            first_pattern=false
+        else
+            find_cmd="$find_cmd -o -name \"$pattern\""
+        fi
+    done
+    find_cmd="$find_cmd \\) -print0 2>/dev/null"
+    
+    while IFS= read -r -d '' file; do
+        local skip=0
+        
+        for exclude in "${exclude_patterns[@]}"; do
+            if [[ "$(basename "$file")" == $exclude ]]; then
+                skip=1
+                log_info "跳过排除文件: $file"
+                break
+            fi
+        done
+        
+        if [ $skip -eq 1 ]; then
+            continue
+        fi
+        
+        local file_size=$(stat -c%s "$file" 2>/dev/null || echo 0)
+        
+        if [ "$dry_run" = "true" ]; then
+            log_delete "[模拟] 将删除: $file (大小: $(format_file_size $file_size))"
+        else
+            if rm -f "$file"; then
+                log_delete "已删除: $file (大小: $(format_file_size $file_size))"
+                ((delete_count++))
+                ((total_size+=file_size))
+            else
+                log_error "删除失败: $file"
+            fi
+        fi
+    done < <(eval "$find_cmd")
+    
+    if [ "$dry_run" != "true" ]; then
+        log_info "目录 $dir 清理完成: 删除文件数=$delete_count, 总大小=$(format_file_size $total_size)"
+    fi
+}
+
+LOG_DIRS=("${DEFAULT_LOG_DIRS[@]}")
+KEEP_DAYS="$DEFAULT_KEEP_DAYS"
+EXCLUDE_PATTERNS=("${DEFAULT_EXCLUDE_PATTERNS[@]}")
+LOG_FILE="$DEFAULT_LOG_FILE"
+LOG_PATTERNS=("${DEFAULT_LOG_PATTERNS[@]}")
+DRY_RUN="false"
+VERBOSE="false"
+
+if [ -n "$CLEAN_LOG_DIRS" ]; then
+    IFS=' ' read -ra LOG_DIRS <<< "$CLEAN_LOG_DIRS"
+fi
+
+if [ -n "$CLEAN_KEEP_DAYS" ]; then
+    KEEP_DAYS="$CLEAN_KEEP_DAYS"
+fi
+
+if [ -n "$CLEAN_EXCLUDE_PATTERNS" ]; then
+    IFS=' ' read -ra EXCLUDE_PATTERNS <<< "$CLEAN_EXCLUDE_PATTERNS"
+fi
+
+if [ -n "$CLEAN_LOG_FILE" ]; then
+    LOG_FILE="$CLEAN_LOG_FILE"
+fi
+
+if [ -n "$CLEAN_LOG_PATTERNS" ]; then
+    IFS=' ' read -ra LOG_PATTERNS <<< "$CLEAN_LOG_PATTERNS"
+fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--dirs)
+            IFS=',' read -ra LOG_DIRS <<< "$2"
+            shift 2
+            ;;
+        -k|--keep-days)
+            KEEP_DAYS="$2"
+            shift 2
+            ;;
+        -e|--exclude)
+            IFS=',' read -ra EXCLUDE_PATTERNS <<< "$2"
+            shift 2
+            ;;
+        -p|--patterns)
+            IFS=',' read -ra LOG_PATTERNS <<< "$2"
+            shift 2
+            ;;
+        -l|--log-file)
+            LOG_FILE="$2"
+            shift 2
+            ;;
+        -n|--dry-run)
+            DRY_RUN="true"
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE="true"
+            shift
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        *)
+            echo "未知选项: $1"
+            show_usage
+            exit 1
+            ;;
+    esac
+done
+
+if [ ${#LOG_DIRS[@]} -eq 0 ]; then
+    echo "错误: 必须指定至少一个要清理的目录"
+    show_usage
+    exit 1
+fi
+
+if ! [[ "$KEEP_DAYS" =~ ^[0-9]+$ ]]; then
+    echo "错误: 保留天数必须是数字"
+    exit 1
+fi
+
+log_info "========================================"
+log_info "开始执行日志清理脚本"
+log_info "脚本版本: 1.0"
+log_info "清理目录: ${LOG_DIRS[*]}"
+log_info "保留天数: ${KEEP_DAYS} 天"
+log_info "文件模式: ${LOG_PATTERNS[*]}"
+log_info "排除模式: ${EXCLUDE_PATTERNS[*]}"
+log_info "操作记录: ${LOG_FILE}"
+log_info "模拟模式: ${DRY_RUN}"
+
+if [ "$DRY_RUN" = "true" ]; then
+    log_warn "注意: 运行在模拟模式，不会实际删除文件"
+fi
+
+for dir in "${LOG_DIRS[@]}"; do
+    clean_directory "$dir" "$KEEP_DAYS" LOG_PATTERNS EXCLUDE_PATTERNS "$DRY_RUN"
+done
+
+log_info "========================================"
+log_info "日志清理脚本执行完成"
