@@ -1,0 +1,1221 @@
+#!/bin/bash
+# ============================================================
+# Oracle CSV 批量导入脚本
+#
+# 功能说明：
+#   1. 读取 import_csv.conf 配置文件
+#   2. 检查 SQL*Plus 客户端
+#   3. 检查数据库连通性（预先检查所有用户）
+#   4. 检查是否有需要导入的 CSV 文件，没有则直接退出
+#   5. 遍历每个 CSV 文件：
+#        - 文件名（去掉 .csv）作为表名
+#        - 行分隔符使用 FIELD_DELIMITER（默认 |~，可配置）
+#        - 第一行作为字段名
+#        - 检查表是否存在、字段是否存在
+#        - 检测字段类型并按类型处理值（空值按空字符串处理）
+#        - 非仅插入文件先 TRUNCATE 再 INSERT
+#        - 每一万行提交一次
+#        - 数据行字段数以表头字段数为准（多余截断，不足补空）
+#        - 第2行 INSERT 语句示例写入单文件日志
+#        - 单独记录每个文件导入日志
+#        - 出错行跳过并记录行号、错误信息
+#   6. 单独记录本次执行的汇总日志
+#   7. 默认后台执行，完成后写入日志
+#
+# 依赖：sqlplus（Oracle Instant Client）
+# ============================================================
+
+set -u
+
+# -------------------- Locale 设置 --------------------
+# 确保 awk/sed 等工具正确处理 UTF-8 多字节中文字符
+# 尝试多种 UTF-8 locale 名称，兼容不同 Linux 发行版
+_UTF8_LOCALE=""
+for _loc in C.UTF-8 en_US.UTF-8 zh_CN.UTF-8 en_US.utf8 zh_CN.utf8 POSIX.UTF-8; do
+    if locale -a 2>/dev/null | grep -qi "^${_loc}$"; then
+        _UTF8_LOCALE="$_loc"
+        break
+    fi
+done
+if [ -z "$_UTF8_LOCALE" ]; then
+    _UTF8_LOCALE=$(locale -a 2>/dev/null | grep -i 'utf.*8' | head -1)
+fi
+if [ -n "$_UTF8_LOCALE" ]; then
+    export LC_ALL="$_UTF8_LOCALE"
+    export LANG="$_UTF8_LOCALE"
+else
+    # 最后兜底：不设置 LC_ALL，但尝试用 LC_CTYPE 单独控制字符分类
+    export LC_CTYPE=en_US.UTF-8 2>/dev/null || true
+fi
+unset _UTF8_LOCALE _loc
+
+# -------------------- 配置文件加载 --------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/import_csv.conf"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "[ERROR] 配置文件不存在: $CONFIG_FILE" >&2
+    exit 1
+fi
+
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+# 提供默认值，避免 set -u 下未定义报错
+SPECIFIED_FILES="${SPECIFIED_FILES:-}"
+SKIP_FILES="${SKIP_FILES:-}"
+INSERT_ONLY_FILES="${INSERT_ONLY_FILES:-}"
+FIELD_DELIMITER="${FIELD_DELIMITER:-|~}"
+MAX_PARALLEL="${MAX_PARALLEL:-1}"
+
+# 设置 NLS_LANG 字符集，解决中文乱码问题（默认 GBK）
+NLS_LANG="${NLS_LANG:-SIMPLIFIED CHINESE_CHINA.ZHS16GBK}"
+export NLS_LANG
+
+# 文件编码设置
+# CSV_FILE_ENCODING: 脚本内部读取 CSV 时使用的编码
+# SQL_FILE_ENCODING: 生成 SQL 文件后、执行 sqlplus 前的目标编码
+# 不设置时默认与系统 locale 一致
+CSV_FILE_ENCODING="${CSV_FILE_ENCODING:-}"
+SQL_FILE_ENCODING="${SQL_FILE_ENCODING:-}"
+
+# 常用转义常量（全局，避免函数内部重复定义）
+_sq="'"          # 单引号字符
+_dq="''"         # Oracle SQL 中单引号转义（两个单引号）
+
+# 校验必填配置
+for var in DB_HOST DB_PORT DB_SERVICE \
+           NLP_USER NLP_PASSWORD NLP_CSV_PATH \
+           STG_USER STG_PASSWORD STG_CSV_PATH \
+           BATCH_LOG_PATH FILE_LOG_PATH; do
+    if [ -z "${!var:-}" ]; then
+        echo "[ERROR] 配置项 $var 未设置或为空" >&2
+        exit 1
+    fi
+done
+
+# -------------------- 日志目录与文件 --------------------
+mkdir -p "$BATCH_LOG_PATH" "$FILE_LOG_PATH"
+
+BATCH_TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+BATCH_LOG_FILE="$BATCH_LOG_PATH/batch_${BATCH_TIMESTAMP}.log"
+BATCH_START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+
+# -------------------- 后台执行 --------------------
+# 若当前是交互式终端运行，则自动 fork 到后台；子进程通过 IMPORT_CSV_BG=1 标记避免重复 fork
+if [ -t 0 ] && [ "${IMPORT_CSV_BG:-0}" != "1" ]; then
+    IMPORT_CSV_BG=1 nohup "$0" >/dev/null 2>&1 &
+    echo "脚本已转入后台运行，PID: $!"
+    echo "批处理日志: $BATCH_LOG_FILE"
+    disown "${!}" 2>/dev/null || true
+    exit 0
+fi
+
+# -------------------- 日志函数 --------------------
+log_batch() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$BATCH_LOG_FILE"
+}
+
+log_file() {
+    local logfile=$1
+    shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$logfile"
+}
+
+# 快速版本：每10秒刷新一次 timestamp，避免热循环里反复调用 date
+_LOG_TS=""
+_LOG_TS_TICK=0
+log_file_fast() {
+    local logfile=$1
+    shift
+    local now_tick
+    now_tick=$SECONDS
+    if [ $((now_tick - _LOG_TS_TICK)) -ge 10 ] || [ -z "$_LOG_TS" ]; then
+        _LOG_TS=$(date '+%Y-%m-%d %H:%M:%S')
+        _LOG_TS_TICK=$now_tick
+    fi
+    echo "[$_LOG_TS] $*" >> "$logfile"
+}
+
+# -------------------- 工具函数 --------------------
+connect_str() {
+    local user=$1
+    local pass=$2
+    echo "${user}/${pass}@${DB_HOST}:${DB_PORT}/${DB_SERVICE}"
+}
+
+# 检查数据库连通性
+# 返回: 0=OK  stdout不输出
+#       1=FAIL stdout输出错误信息（已按 NLS_LANG 解码为 UTF-8）
+check_db_connection() {
+    local user=$1
+    local pass=$2
+    local raw_result conv_result
+    local nls_encoding="GBK"
+    case "$NLS_LANG" in
+        *UTF8*|*AL32UTF8*|*utf8*|*UTF-8*) nls_encoding="UTF-8" ;;
+    esac
+    raw_result=$(sqlplus -s -L "$(connect_str "$user" "$pass")" <<'EOF' 2>&1
+SET HEAD OFF FEEDBACK OFF
+SELECT 1 FROM DUAL;
+EXIT;
+EOF
+)
+    # sqlplus 返回 SELECT 1 成功
+    if echo "$raw_result" | grep -qE '^[[:space:]]*1[[:space:]]*$'; then
+        return 0
+    fi
+    # 失败：将输出由 nls_encoding 转为 UTF-8（避免中文乱码）
+    if [ "$nls_encoding" != "UTF-8" ] && command -v iconv >/dev/null 2>&1; then
+        conv_result=$(iconv -f "$nls_encoding" -t UTF-8 <<<"$raw_result" 2>/dev/null)
+        [ -n "$conv_result" ] && raw_result="$conv_result"
+    fi
+    echo "$raw_result"
+    return 1
+}
+
+# 检查表是否存在
+# 同时查 user_tables 和 all_tables，增加命中率
+# 调试模式下将原始输出存入 TABLE_CHECK_RAW 变量
+check_table_exists() {
+    local user=$1
+    local pass=$2
+    local table=$3
+    local result cnt
+    result=$(sqlplus -s -L "$(connect_str "$user" "$pass")" <<EOF 2>&1
+SET HEAD OFF FEEDBACK OFF PAGES 0 VERIFY OFF ECHO OFF TRIMSPOOL ON TRIMOUT OFF
+SELECT COUNT(*) FROM (
+  SELECT table_name FROM user_tables WHERE table_name = UPPER('${table}')
+  UNION ALL
+  SELECT table_name FROM all_tables WHERE table_name = UPPER('${table}') AND ROWNUM = 1
+);
+EXIT;
+EOF
+)
+    TABLE_CHECK_RAW="$result"
+    cnt=$(echo "$result" | tr -d ' \r\n\t\f' | grep -oE '[0-9]+' | head -n 1)
+    if [[ "$cnt" =~ ^[0-9]+$ ]] && [ "$cnt" -gt 0 ]; then
+        return 0
+    fi
+    return 1
+}
+
+# 检查字段是否存在
+# 同时查 user_tab_columns 和 all_tab_columns，增加命中率
+# 调试模式下将原始输出存入 FIELD_CHECK_RAW 变量
+check_field_exists() {
+    local user=$1
+    local pass=$2
+    local table=$3
+    local field=$4
+    local result cnt
+    result=$(sqlplus -s -L "$(connect_str "$user" "$pass")" <<EOF 2>&1
+SET HEAD OFF FEEDBACK OFF PAGES 0 VERIFY OFF ECHO OFF TRIMSPOOL ON TRIMOUT OFF
+SELECT COUNT(*) FROM (
+  SELECT column_name FROM user_tab_columns
+   WHERE table_name = UPPER('${table}')
+     AND column_name = UPPER('${field}')
+  UNION ALL
+  SELECT column_name FROM all_tab_columns
+   WHERE table_name = UPPER('${table}')
+     AND column_name = UPPER('${field}')
+     AND ROWNUM = 1
+);
+EXIT;
+EOF
+)
+    FIELD_CHECK_RAW="$result"
+    cnt=$(echo "$result" | tr -d ' \r\n\t\f' | grep -oE '[0-9]+' | head -n 1)
+    if [[ "$cnt" =~ ^[0-9]+$ ]] && [ "$cnt" -gt 0 ]; then
+        return 0
+    fi
+    return 1
+}
+
+# 截断表
+truncate_table() {
+    local user=$1
+    local pass=$2
+    local table=$3
+    sqlplus -s -L "$(connect_str "$user" "$pass")" <<EOF 2>&1
+SET HEAD OFF FEEDBACK OFF
+TRUNCATE TABLE ${table};
+EXIT;
+EOF
+}
+
+# 获取字段类型信息
+# 返回: 字段名|类型|是否可空(Y/N)
+# 优先查 user_tab_columns，查不到再查 all_tab_columns
+get_field_types() {
+    local user=$1
+    local pass=$2
+    local table=$3
+    local result
+    result=$(sqlplus -s -L "$(connect_str "$user" "$pass")" <<EOF 2>&1
+SET HEAD OFF FEEDBACK OFF PAGES 0 VERIFY OFF ECHO OFF TRIMSPOOL ON TRIMOUT OFF COLSEP '|'
+SELECT column_name, data_type, nullable
+  FROM user_tab_columns
+ WHERE table_name = UPPER('${table}')
+ ORDER BY column_id;
+EXIT;
+EOF
+)
+    # 如果 user_tab_columns 没查到，尝试 all_tab_columns
+    local cnt
+    cnt=$(echo "$result" | grep -cE '^[A-Za-z0-9_]+\|')
+    if [ "$cnt" -eq 0 ]; then
+        result=$(sqlplus -s -L "$(connect_str "$user" "$pass")" <<EOF 2>&1
+SET HEAD OFF FEEDBACK OFF PAGES 0 VERIFY OFF ECHO OFF TRIMSPOOL ON TRIMOUT OFF COLSEP '|'
+SELECT column_name, data_type, nullable
+  FROM all_tab_columns
+ WHERE table_name = UPPER('${table}')
+ ORDER BY column_id;
+EXIT;
+EOF
+)
+    fi
+    echo "$result"
+}
+
+# 按指定分隔符拆分一行，处理双引号内的分隔符和空值
+# 参数: line delimiter
+# 结果存入全局数组 VALUES_ARRAY
+# 规则：
+#   - 字段被双引号包裹时，内部的分隔符不分割
+#   - 双引号内连续两个 "" 表示一个双引号字符
+#   - 只有完整的 "..." 包裹才作为引号字段
+split_line() {
+    local line=$1
+    local delim=$2
+    VALUES_ARRAY=()
+    local field=""
+    local i=0
+    local len=${#line}
+    local delim_len=${#delim}
+    local in_field_quote=0
+
+    while [ $i -lt $len ]; do
+        local char="${line:$i:1}"
+
+        if [ "$in_field_quote" -eq 0 ] && [ ${#field} -eq 0 ] && [ "$char" = '"' ]; then
+            in_field_quote=1
+            i=$((i + 1))
+            continue
+        fi
+
+        if [ "$in_field_quote" -eq 1 ] && [ "$char" = '"' ]; then
+            local next_char=""
+            if [ $((i + 1)) -lt $len ]; then
+                next_char="${line:$((i + 1)):1}"
+            fi
+            if [ "$next_char" = '"' ]; then
+                field+='"'
+                i=$((i + 2))
+                continue
+            else
+                in_field_quote=0
+                i=$((i + 1))
+                continue
+            fi
+        fi
+
+        if [ "$in_field_quote" -eq 0 ] && [ $((i + delim_len)) -le $len ]; then
+            local candidate="${line:$i:$delim_len}"
+            if [ "$candidate" = "$delim" ]; then
+                VALUES_ARRAY+=("$field")
+                field=""
+                i=$((i + delim_len))
+                continue
+            fi
+        fi
+
+        field+="$char"
+        i=$((i + 1))
+    done
+
+    VALUES_ARRAY+=("$field")
+}
+
+# 判断值是否为数字（整数或小数）
+is_numeric() {
+    local val=$1
+    if [[ "$val" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# 根据字段类型处理值（全局变量返回版，避免子进程fork）
+# 参数: field_type value
+# 结果存入全局变量 PROCESSED_VAL
+# 空数据按空字符串 '' 处理，不使用 NULL
+process_value() {
+    local field_type=$1
+    local val=$2
+
+    # 去除首尾空格（bash内置）
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+
+    if [ -z "$val" ]; then
+        PROCESSED_VAL="''"
+        return
+    fi
+
+    case "$field_type" in
+        NUMBER*)
+            if [[ "$val" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+                PROCESSED_VAL="$val"
+            else
+                PROCESSED_VAL="''"
+            fi
+            ;;
+        DATE*)
+            val="${val//$_sq/$_dq}"
+            PROCESSED_VAL="TO_DATE('${val}', 'YYYY/MM/DD HH24:MI:SS')"
+            ;;
+        TIMESTAMP*)
+            val="${val//$_sq/$_dq}"
+            PROCESSED_VAL="TO_TIMESTAMP('${val}', 'YYYY/MM/DD HH24:MI:SS.FF')"
+            ;;
+        CHAR*|VARCHAR*|NVARCHAR*|CLOB*)
+            val="${val//$_sq/$_dq}"
+            PROCESSED_VAL="'$val'"
+            ;;
+        *)
+            val="${val//$_sq/$_dq}"
+            PROCESSED_VAL="'$val'"
+            ;;
+    esac
+}
+
+# 判断文件名是否在指定列表中（空格分隔的字符串）
+in_list() {
+    local target=$1
+    local list=$2
+    [ -z "$list" ] && return 1
+    for item in $list; do
+        if [ "$item" = "$target" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 获取需要导入的文件列表（输出绝对路径，空格分隔）
+get_files_to_import() {
+    local csv_path=$1
+    local specified=$2
+    local skip=$3
+    local result=()
+    local f fname
+
+    # 空表示没有文件
+    [ -z "$specified" ] && return
+
+    if [ "$specified" = "*" ]; then
+        for f in "$csv_path"/*.csv; do
+            [ -f "$f" ] || continue
+            fname=$(basename "$f")
+            if in_list "$fname" "$skip"; then
+                continue
+            fi
+            result+=("$f")
+        done
+    else
+        for fname in $specified; do
+            if in_list "$fname" "$skip"; then
+                continue
+            fi
+            f="$csv_path/$fname"
+            if [ -f "$f" ]; then
+                result+=("$f")
+            fi
+        done
+    fi
+    echo "${result[@]}"
+}
+
+# -------------------- 单文件 SQL 生成 --------------------
+# 参数: user pass filepath is_insert_only file_log sql_temp_dir batch_timestamp
+# 返回: filename|tablename|delete_flag|total_data_lines|sql_file|状态
+generate_sql_file() {
+    local user=$1
+    local pass=$2
+    local filepath=$3
+    local is_insert_only=$4
+    local file_log=$5
+    local sql_temp_dir=$6
+    local batch_ts=$7
+
+    local filename
+    filename=$(basename "$filepath")
+    local tablename="${filename%.csv}"
+    tablename=$(echo "$tablename" | tr '[:lower:]' '[:upper:]')
+
+    log_file "$file_log" "===== 开始生成 SQL: $filename ====="
+    log_file "$file_log" "用户: $user | 表名: $tablename | 仅插入: $is_insert_only"
+    log_file "$file_log" "字段分隔符: '${FIELD_DELIMITER}'"
+
+    local delete_flag=0
+    local total_data_lines=0
+    local batch_size=10000
+
+    # 1. 检查表是否存在
+    if ! check_table_exists "$user" "$pass" "$tablename"; then
+        log_file "$file_log" "[ERROR] 表 $tablename 不存在，跳过该文件"
+        log_file "$file_log" "[DEBUG] SQL*Plus 原始输出: ${TABLE_CHECK_RAW}"
+        echo "${filename}|${tablename}|0|0||表不存在"
+        return 1
+    fi
+    log_file "$file_log" "表 $tablename 存在"
+
+    # 2. 读取第一行作为字段名
+    local header
+    header=$(head -n 1 "$filepath" | tr -d '\r')
+    if [ -z "$header" ]; then
+        log_file "$file_log" "[ERROR] 文件为空或无表头，跳过该文件"
+        echo "${filename}|${tablename}|0|0||无表头"
+        return 1
+    fi
+
+    split_line "$header" "$FIELD_DELIMITER"
+    local field_list=""
+    local field_arr=()
+    local missing_fields=()
+    for field in "${VALUES_ARRAY[@]}"; do
+        field="${field#"${field%%[![:space:]]*}"}"
+        field="${field%"${field##*[![:space:]]}"}"
+        [ -z "$field" ] && continue
+        field_arr+=("$field")
+        if [ -z "$field_list" ]; then
+            field_list="$field"
+        else
+            field_list="$field_list, $field"
+        fi
+        if ! check_field_exists "$user" "$pass" "$tablename" "$field"; then
+            missing_fields+=("$field")
+        fi
+    done
+
+    if [ ${#missing_fields[@]} -gt 0 ]; then
+        log_file "$file_log" "[ERROR] 表 $tablename 缺少字段: ${missing_fields[*]}，跳过该文件"
+        echo "${filename}|${tablename}|0|0||字段缺失"
+        return 1
+    fi
+    log_file "$file_log" "所有字段存在: $field_list"
+
+    # 获取字段类型信息
+    declare -A field_types
+    local types_output
+    types_output=$(get_field_types "$user" "$pass" "$tablename")
+    while IFS='|' read -r fname ftype fnullable; do
+        fname="${fname:-}"
+        ftype="${ftype:-}"
+        fname="${fname#"${fname%%[![:space:]]*}"}"
+        fname="${fname%"${fname##*[![:space:]]}"}"
+        ftype="${ftype#"${ftype%%[![:space:]]*}"}"
+        ftype="${ftype%"${ftype##*[![:space:]]}"}"
+        [ -z "$fname" ] && continue
+        field_types["$fname"]="$ftype"
+    done <<< "${types_output:-}"
+    log_file "$file_log" "字段类型已获取"
+
+    # 读取第2行数据，生成INSERT语句示例用于日志排查
+    local second_line
+    second_line=$(sed -n '2p' "$filepath" | tr -d '\r')
+    if [ -n "$second_line" ]; then
+        split_line "$second_line" "$FIELD_DELIMITER"
+        local sample_values=""
+        local idx=0
+        for field in "${field_arr[@]}"; do
+            local val="${VALUES_ARRAY[$idx]:-}"
+            local ftype="${field_types[$field]:-VARCHAR2}"
+            process_value "$ftype" "$val"
+            if [ -z "$sample_values" ]; then
+                sample_values="$PROCESSED_VAL"
+            else
+                sample_values="$sample_values, $PROCESSED_VAL"
+            fi
+            idx=$((idx + 1))
+        done
+        log_file "$file_log" "第2行插入语句示例: INSERT INTO ${tablename} (${field_list}) VALUES (${sample_values});"
+    fi
+
+    if [ "$is_insert_only" = "false" ]; then
+        delete_flag=1
+        log_file "$file_log" "将在 SQL 文件中包含 TRUNCATE TABLE $tablename"
+    else
+        log_file "$file_log" "仅插入模式，不包含 TRUNCATE"
+    fi
+
+    total_data_lines=$(( $(wc -l < "$filepath") - 1 ))
+    [ "$total_data_lines" -lt 0 ] && total_data_lines=0
+    log_file "$file_log" "待导入数据行数: $total_data_lines"
+
+    # 生成 SQL 文件（保留，不删除）
+    local sql_file="${sql_temp_dir}/${user}_${tablename}_${batch_ts}.sql"
+
+    # 处理 CSV 文件编码转换
+    local csv_input_stream
+    if [ -n "$CSV_FILE_ENCODING" ] && command -v iconv >/dev/null 2>&1; then
+        log_file "$file_log" "[INFO] CSV 文件编码: $CSV_FILE_ENCODING，使用 iconv 转换为 UTF-8 处理"
+        csv_input_stream="iconv -f $CSV_FILE_ENCODING -t UTF-8 $filepath 2>/dev/null"
+    else
+        csv_input_stream="cat $filepath"
+    fi
+
+    {
+        echo "SET HEAD OFF FEEDBACK OFF ECHO OFF PAGES 0"
+        echo "SET LINESIZE 32767"
+        echo "SET LONG 32767"
+        echo "WHENEVER SQLERROR CONTINUE;"
+
+        # TRUNCATE 放在 SQL 文件中统一执行
+        if [ "$is_insert_only" = "false" ]; then
+            echo "PROMPT ===TRUNCATE_START==="
+            echo "TRUNCATE TABLE ${tablename};"
+            echo "PROMPT ===TRUNCATE_END==="
+        fi
+
+        # 按 field_arr 的顺序把对应字段类型拼成管道分隔字符串（传给 awk）
+        local ftype_list=""
+        for field in "${field_arr[@]}"; do
+            local ft="${field_types[$field]:-VARCHAR2}"
+            if [ -z "$ftype_list" ]; then
+                ftype_list="$ft"
+            else
+                ftype_list="$ftype_list|$ft"
+            fi
+        done
+        local field_count=${#field_arr[@]}
+        local progress_interval=10000
+
+        # 初始化 batch_count（set -u 保护，awk 内部会累加但不会回传）
+    local batch_count=0
+
+    # 用单个 awk 调用生成所有 INSERT SQL（替换 bash 逐行循环，速度提升50-100倍）
+        eval "$csv_input_stream" | awk \
+            -v TABLENAME="$tablename" \
+            -v FIELDLIST="$field_list" \
+            -v DELIM="$FIELD_DELIMITER" \
+            -v FIELD_COUNT="$field_count" \
+            -v TYPE_LIST="$ftype_list" \
+            -v BATCH_SIZE="$batch_size" \
+            -v PROGRESS_FILE="$file_log" \
+            -v PROGRESS_INTERVAL="$progress_interval" \
+            -v TOTAL_LINES="$total_data_lines" \
+'
+function trim(s) {
+    gsub(/^[ \t\r\n]+/, "", s)
+    gsub(/[ \t\r\n]+$/, "", s)
+    return s
+}
+
+function escape_q(s) {
+    gsub(/\047/, "\047\047", s)
+    return s
+}
+
+function is_numeric(s,   r) {
+    if (s ~ /^-?[0-9]+(\.[0-9]+)?$/) return 1
+    return 0
+}
+
+function process_val(ftype, val,   t) {
+    val = trim(val)
+    if (val == "") return "\047\047"
+    if (ftype ~ /^NUMBER/) {
+        if (is_numeric(val)) return val
+        else return "\047\047"
+    }
+    if (ftype ~ /^DATE/) {
+        return "TO_DATE(\047" escape_q(val) "\047, \047YYYY/MM/DD HH24:MI:SS\047)"
+    }
+    if (ftype ~ /^TIMESTAMP/) {
+        return "TO_TIMESTAMP(\047" escape_q(val) "\047, \047YYYY/MM/DD HH24:MI:SS.FF\047)"
+    }
+    return "\047" escape_q(val) "\047"
+}
+
+function split_csv(line, arr, delim,    dl, ll, i, j, field, inq, c, nc, arrn, cand) {
+    dl = length(delim)
+    ll = length(line)
+    delete arr
+    arrn = 0
+    field = ""
+    inq = 0
+    i = 1
+    while (i <= ll) {
+        c = substr(line, i, 1)
+        if (inq == 0 && field == "" && c == "\042") {
+            inq = 1
+            i++
+            continue
+        }
+        if (inq == 1 && c == "\042") {
+            nc = substr(line, i+1, 1)
+            if (nc == "\042") {
+                field = field "\042"
+                i += 2
+                continue
+            } else {
+                inq = 0
+                i++
+                continue
+            }
+        }
+        if (inq == 0 && (i + dl - 1) <= ll) {
+            cand = substr(line, i, dl)
+            if (cand == delim) {
+                arrn++
+                arr[arrn] = field
+                field = ""
+                i += dl
+                continue
+            }
+        }
+        field = field c
+        i++
+    }
+    arrn++
+    arr[arrn] = field
+    return arrn
+}
+
+BEGIN {
+    # 解析类型列表
+    TCOUNT = split(TYPE_LIST, TARR, "|")
+    batch_count = 0
+    last_progress = 0
+    line_num = 0
+}
+
+{
+    line_num++
+    if (line_num == 1) next
+    sub(/\r$/, "")
+    if ($0 == "") next
+
+    n = split_csv($0, CARR, DELIM)
+    if (n > FIELD_COUNT) n = FIELD_COUNT
+    while (n < FIELD_COUNT) { n++; CARR[n] = "" }
+
+    # 构建 VALUES 列表（拆成多行，避免 sqlplus 单行2499字符限制）
+    val_lines = ""
+    val_line = ""
+    for (k = 1; k <= FIELD_COUNT; k++) {
+        t = (k <= TCOUNT) ? TARR[k] : "VARCHAR2"
+        pv = process_val(t, CARR[k])
+        # 加逗号分隔符（最后一个字段不加逗号）
+        if (k < FIELD_COUNT) pv = pv ", "
+
+        if (val_line == "") val_line = "    " pv
+        else val_line = val_line pv
+
+        # 每10个字段或每行字符数超限时换行
+        if (k % 10 == 0 || length(val_line) > 400) {
+            if (val_lines == "") val_lines = val_line
+            else val_lines = val_lines "\n" val_line
+            val_line = ""
+        }
+    }
+    if (val_line != "") {
+        if (val_lines == "") val_lines = val_line
+        else val_lines = val_lines "\n" val_line
+    }
+
+    print "PROMPT ===LINE:" line_num "==="
+    print "INSERT INTO " TABLENAME " (" FIELDLIST ")"
+    print "VALUES (" val_lines ");"
+
+    batch_count++
+    if (batch_count % BATCH_SIZE == 0) {
+        print "COMMIT;"
+        print "PROMPT ===COMMIT_BATCH:" batch_count "==="
+    }
+
+    if (PROGRESS_FILE != "" && batch_count >= (last_progress + PROGRESS_INTERVAL)) {
+        cmd = "date +\047[%Y-%m-%d %H:%M:%S]\047"
+        cmd | getline dts
+        close(cmd)
+        print dts " [INFO] 已生成 SQL " batch_count " / " TOTAL_LINES " 行" >> PROGRESS_FILE
+        last_progress = batch_count
+    }
+}
+
+END {
+    print "PROMPT ===COMMIT_BATCH:" batch_count "==="
+    print "COMMIT;"
+    print "EXIT;"
+}
+'
+    } > "$sql_file"
+
+    # 将 SQL 文件直接转换为指定编码（源编码固定 UTF-8，因为 bash 脚本生成的文件都是 UTF-8）
+    if [ -n "$SQL_FILE_ENCODING" ] && command -v iconv >/dev/null 2>&1; then
+        local tmp_conv="${sql_file}.tmp"
+        local conv_err
+        conv_err=$(iconv -f UTF-8 -t "$SQL_FILE_ENCODING" "$sql_file" > "$tmp_conv" 2>&1)
+        local conv_rc=$?
+        if [ $conv_rc -eq 0 ]; then
+            mv -f "$tmp_conv" "$sql_file"
+            log_file "$file_log" "[INFO] SQL 文件已从 UTF-8 转换为 $SQL_FILE_ENCODING 编码: $sql_file"
+        else
+            rm -f "$tmp_conv"
+            log_file "$file_log" "[ERROR] SQL 文件编码转换失败(rc=$conv_rc): $conv_err"
+            log_file "$file_log" "[ERROR] 请检查 CSV 文件是否包含无法转换为 $SQL_FILE_ENCODING 的字符"
+        fi
+    elif [ -n "$SQL_FILE_ENCODING" ]; then
+        log_file "$file_log" "[WARN] iconv 命令不存在，无法转换 SQL 文件编码为 $SQL_FILE_ENCODING"
+    fi
+
+    # 用 wc -l 统计 SQL 文件实际行数
+    local sql_line_count
+    sql_line_count=$(wc -l < "$sql_file" 2>/dev/null)
+    [ -z "$sql_line_count" ] && sql_line_count=0
+    log_file "$file_log" "[INFO] SQL 文件生成完成: $sql_file (共 $sql_line_count 行)"
+
+    echo "${filename}|${tablename}|${delete_flag}|${total_data_lines}|${sql_file}|SQL生成完成"
+}
+
+# -------------------- 执行 SQL 文件 --------------------
+# 参数: user pass sql_file file_log total_data_lines tablename
+# 返回: insert_count|error_count|truncate_ok
+execute_sql_file() {
+    local user=$1
+    local pass=$2
+    local sql_file=$3
+    local file_log=$4
+    local total_data_lines=$5
+    local tablename=$6
+
+    local error_count=0
+    local truncate_failed=0
+    local actual_inserted=0
+    local last_committed_batch=0
+
+    log_file "$file_log" "[INFO] 开始执行 SQL 文件: $sql_file"
+    log_file "$file_log" "[INFO] 目标总行数: $total_data_lines"
+
+    # 执行 sqlplus，获取原始输出（输出编码由 NLS_LANG 决定，ZHS16GBK 时为 GBK）
+    # 使用临时文件捕获原始输出，避免 bash 变量吞噬二进制数据
+    local raw_out_file="${file_log}.raw"
+    sqlplus -s -L "$(connect_str "$user" "$pass")" @"$sql_file" > "$raw_out_file" 2>&1
+    local sqlplus_rc=$?
+    log_file "$file_log" "[INFO] sqlplus 执行完成，退出码=$sqlplus_rc"
+
+    # 将 sqlplus 输出由 GBK 转换为 UTF-8（NLS_LANG=ZHS16GBK 时输出一定是 GBK）
+    # 注意：输入编码必须是 GBK（由 NLS_LANG 决定），不是 SQL_FILE_ENCODING
+    local output=""
+    local nls_encoding="GBK"
+    case "$NLS_LANG" in
+        *UTF8*|*AL32UTF8*|*utf8*|*UTF-8*) nls_encoding="UTF-8" ;;
+    esac
+    local conv_out_file="${file_log}.utf8"
+    if command -v iconv >/dev/null 2>&1; then
+        # 不用 -c：保留无法转换的字节，防止静默吞掉错误信息
+        local iconv_err
+        iconv_err=$(iconv -f "$nls_encoding" -t UTF-8 "$raw_out_file" > "$conv_out_file" 2>&1)
+        local iconv_rc=$?
+        if [ -s "$conv_out_file" ]; then
+            output=$(cat "$conv_out_file")
+            log_file "$file_log" "[INFO] sqlplus 输出已从 $nls_encoding 转换为 UTF-8（iconv rc=$iconv_rc）"
+            if [ $iconv_rc -ne 0 ] && [ -n "$iconv_err" ]; then
+                log_file "$file_log" "[WARN] iconv 警告: $iconv_err"
+            fi
+        else
+            output=$(cat "$raw_out_file")
+            log_file "$file_log" "[WARN] 编码转换输出为空，使用原始输出（$nls_encoding）"
+        fi
+    else
+        output=$(cat "$raw_out_file")
+        log_file "$file_log" "[WARN] iconv 命令不存在，使用原始输出（$nls_encoding）"
+    fi
+    rm -f "$conv_out_file"
+
+    # 将完整 sqlplus 输出追加到文件日志（便于排查问题）
+    log_file "$file_log" "========== sqlplus 原始输出开始 =========="
+    while IFS= read -r rawline; do
+        log_file "$file_log" "[sqlplus] $rawline"
+    done <<< "$output"
+    log_file "$file_log" "========== sqlplus 原始输出结束 =========="
+
+    # 解析输出
+    local current_line=""
+    local in_error=false
+    local in_truncate=false
+    local fatal_error=0          # 致命错误：连接失败、sqlplus 退出码非0等，直接记 0 插入
+    local login_denied=0
+    while IFS= read -r outline; do
+        # 跳过 PROMPT 前缀和空行
+        case "$outline" in
+            "PROMPT "*) outline="${outline#PROMPT }" ;;
+        esac
+        [ -z "$outline" ] && continue
+
+        if [[ "$outline" =~ ^===TRUNCATE_START===$ ]]; then
+            in_truncate=true
+        elif [[ "$outline" =~ ^===TRUNCATE_END===$ ]]; then
+            in_truncate=false
+        elif [[ "$outline" =~ ^===LINE:([0-9]+)===$ ]]; then
+            current_line="${BASH_REMATCH[1]}"
+            in_error=false
+        elif [[ "$outline" =~ ^===COMMIT_BATCH:([0-9]+)===$ ]]; then
+            last_committed_batch="${BASH_REMATCH[1]}"
+            log_file "$file_log" "[INFO] 已提交 ${last_committed_batch} 行"
+        elif echo "$outline" | grep -qiE 'ora-[0-9]+|^sp2-[0-9]+|^error'; then
+            if [ "$in_truncate" = "true" ]; then
+                log_file "$file_log" "[ERROR] TRUNCATE 失败: $outline"
+                truncate_failed=1
+                fatal_error=1
+            elif [ -n "$current_line" ] && [ "$in_error" = "false" ]; then
+                error_count=$((error_count + 1))
+                log_file "$file_log" "[ERROR] 第 ${current_line} 行出错: $outline"
+                in_error=true
+            elif [ "$in_error" = "true" ]; then
+                log_file "$file_log" "       -> $outline"
+            else
+                # 连接级/全局错误：current_line 为空，任何 ORA-xxx SP2-xxx ERROR: 都属于致命错误
+                error_count=$((error_count + 1))
+                log_file "$file_log" "[ERROR] SQL 致命错误: $outline"
+                in_error=true
+                fatal_error=1
+                # 识别登录失败
+                if echo "$outline" | grep -qiE 'ORA-01017|logon denied|无法连接|SP2-0751'; then
+                    login_denied=1
+                fi
+            fi
+        elif [ "$in_error" = "true" ]; then
+            # 错误后续的多行补充信息
+            log_file "$file_log" "       -> $outline"
+            if echo "$outline" | grep -qiE 'ORA-01017|logon denied|无法连接|SP2-0751'; then
+                login_denied=1
+            fi
+        fi
+    done <<< "$output"
+
+    # sqlplus 退出码非 0 → 视为致命错误
+    if [ "$sqlplus_rc" -ne 0 ]; then
+        fatal_error=1
+        log_file "$file_log" "[WARN] sqlplus 退出码=$sqlplus_rc（非0），标记为致命错误"
+    fi
+    if [ "$login_denied" -eq 1 ]; then
+        log_file "$file_log" "[ERROR] 检测到登录失败（ORA-01017/无法连接），请检查配置文件中的用户名/密码或 TNS 连接串"
+    fi
+
+    # 实际插入行数计算
+    local insert_count=0
+    if [ "$fatal_error" -eq 1 ]; then
+        # 致命错误：连接失败、登录失败、sqlplus 报错退出 -> 插入量一定是 0
+        insert_count=0
+        log_file "$file_log" "[WARN] 存在致命错误，插入行数按 0 计"
+    elif [ "$last_committed_batch" -gt 0 ]; then
+        # 有 COMMIT_BATCH 标记：至少最后一批实际被提交了
+        local remaining=$((total_data_lines - last_committed_batch))
+        [ "$remaining" -lt 0 ] && remaining=0
+        insert_count=$((last_committed_batch + remaining))
+        # 如果有错误，扣掉错误数
+        if [ "$error_count" -gt 0 ]; then
+            insert_count=$((total_data_lines - error_count))
+            [ "$insert_count" -lt 0 ] && insert_count=0
+        fi
+    else
+        # 没有 COMMIT_BATCH 标记
+        if [ "$error_count" -gt 0 ]; then
+            insert_count=$((total_data_lines - error_count))
+        else
+            # 无错误且无 COMMIT_BATCH，可能总行数 < BATCH_SIZE 或 COMMIT_BATCH 没被正确解析
+            # 只有 sqlplus_rc=0 且 truncate 没失败的情况下，才认为插入成功
+            if [ "$sqlplus_rc" -eq 0 ] && [ "$truncate_failed" -eq 0 ]; then
+                insert_count=$total_data_lines
+            else
+                insert_count=0
+            fi
+        fi
+    fi
+    [ "$insert_count" -lt 0 ] && insert_count=0
+    # 错误数 >= 总行数时，插入数强制 0
+    if [ "$error_count" -ge "$total_data_lines" ]; then
+        insert_count=0
+    fi
+
+    log_file "$file_log" "===== 文件处理完成: 总行=$total_data_lines 插入=$insert_count 错误=$error_count 最后提交批次=$last_committed_batch 退出码=$sqlplus_rc 致命错误=$fatal_error ====="
+
+    # 清理原始输出文件（保留当次的最后一次，注释掉下面一行可以保留用于调试）
+    rm -f "$raw_out_file"
+
+    echo "${insert_count}|${error_count}|${truncate_failed}"
+}
+
+# -------------------- 主流程 --------------------
+log_batch "============================================================"
+log_batch "CSV 批量导入开始"
+log_batch "开始时间: $BATCH_START_TIME"
+log_batch "数据库: ${DB_HOST}:${DB_PORT}/${DB_SERVICE}"
+log_batch "NLS_LANG: ${NLS_LANG}"
+log_batch "配置文件: $CONFIG_FILE"
+log_batch "指定文件: '${SPECIFIED_FILES}'"
+log_batch "跳过文件: '${SKIP_FILES}'"
+log_batch "仅插入文件: '${INSERT_ONLY_FILES}'"
+log_batch "字段分隔符: '${FIELD_DELIMITER}'"
+log_batch "并发数: $MAX_PARALLEL"
+log_batch "批处理大小: 10000 行/批"
+log_batch "------------------------------------------------------------"
+
+USERS_LIST=(
+    "nlp:${NLP_USER}:${NLP_PASSWORD}:${NLP_CSV_PATH}"
+    "stg:${STG_USER}:${STG_PASSWORD}:${STG_CSV_PATH}"
+)
+
+declare -A USER_CONN_STATUS=()
+declare -a SUMMARY_ROWS=()
+
+# -------------------- 步骤0: 检查 SQL*Plus 客户端 --------------------
+log_batch "========== 步骤0: 检查 SQL*Plus 客户端 =========="
+if ! command -v sqlplus &> /dev/null; then
+    log_batch "[ERROR] SQL*Plus 客户端未安装或未配置到 PATH 中"
+    log_batch "[ERROR] 请安装 Oracle Instant Client 并将 sqlplus 路径添加到环境变量"
+    log_batch "结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
+    log_batch "============================================================"
+    echo "[ERROR] SQL*Plus 客户端未安装，请安装 Oracle Instant Client" >&2
+    exit 1
+fi
+
+sqlplus_version=$(sqlplus -v 2>&1 | head -n 1)
+log_batch "SQL*Plus 客户端版本: $sqlplus_version"
+log_batch "SQL*Plus 检查通过"
+log_batch "------------------------------------------------------------"
+
+# -------------------- 步骤1: 预先检查所有用户数据库连通性 --------------------
+log_batch "========== 步骤1: 检查数据库连通性 =========="
+for user_entry in "${USERS_LIST[@]}"; do
+    IFS=':' read -r label user pass csv_path <<< "$user_entry"
+
+    log_batch "检查用户 [$label] ($user) 数据库连通性 ..."
+
+    if [ ! -d "$csv_path" ]; then
+        log_batch "[WARN] CSV 路径不存在: $csv_path"
+    fi
+
+    local_conn_out=""
+    if ! local_conn_out=$(check_db_connection "$user" "$pass"); then
+        log_batch "[ERROR] 用户 $user 无法连接数据库: $local_conn_out"
+        USER_CONN_STATUS["$label"]="FAIL"
+    else
+        log_batch "用户 $user 数据库连接正常"
+        USER_CONN_STATUS["$label"]="OK"
+    fi
+done
+log_batch "数据库连通性检查完成"
+log_batch "------------------------------------------------------------"
+
+# -------------------- 步骤2: 检查是否有需要导入的文件 --------------------
+log_batch "========== 步骤2: 检查导入文件 =========="
+if [ -z "$SPECIFIED_FILES" ]; then
+    log_batch "[INFO] SPECIFIED_FILES 为空，没有需要导入的文件，直接退出"
+    log_batch "结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
+    log_batch "============================================================"
+    exit 0
+fi
+
+# 预检查所有用户的可导入文件数量
+TOTAL_FILES_AVAIL=0
+for user_entry in "${USERS_LIST[@]}"; do
+    IFS=':' read -r label user pass csv_path <<< "$user_entry"
+    [ "${USER_CONN_STATUS[$label]:-FAIL}" != "OK" ] && continue
+    [ ! -d "$csv_path" ] && continue
+    files_str=$(get_files_to_import "$csv_path" "$SPECIFIED_FILES" "$SKIP_FILES")
+    [ -z "$files_str" ] && continue
+    for f in $files_str; do
+        TOTAL_FILES_AVAIL=$((TOTAL_FILES_AVAIL + 1))
+    done
+done
+
+if [ "$TOTAL_FILES_AVAIL" -eq 0 ]; then
+    log_batch "[INFO] 未找到任何需要导入的 CSV 文件，直接退出"
+    log_batch "结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
+    log_batch "============================================================"
+    exit 0
+fi
+log_batch "共找到 $TOTAL_FILES_AVAIL 个待导入文件"
+log_batch "------------------------------------------------------------"
+
+# -------------------- 创建 SQL 临时文件目录 --------------------
+SQL_TEMP_DIR="$FILE_LOG_PATH/sql_${BATCH_TIMESTAMP}"
+mkdir -p "$SQL_TEMP_DIR"
+log_batch "SQL 临时文件目录: $SQL_TEMP_DIR"
+log_batch "------------------------------------------------------------"
+
+# -------------------- 步骤3: 生成所有 SQL 文件 --------------------
+log_batch "========== 步骤3: 生成 SQL 文件 (并发数: $MAX_PARALLEL) =========="
+declare -a PENDING_SQL=()
+
+# 并发控制：等待直到后台任务数 < MAX_PARALLEL
+wait_for_slot() {
+    if [ "$MAX_PARALLEL" -le 1 ]; then return; fi
+    while [ "$(jobs -rp | wc -l)" -ge "$MAX_PARALLEL" ]; do
+        sleep 0.2
+    done
+}
+
+# 收集后台任务结果的临时目录
+GEN_RESULT_DIR="$SQL_TEMP_DIR/gen_results"
+mkdir -p "$GEN_RESULT_DIR"
+GEN_JOB_ID=0
+
+for user_entry in "${USERS_LIST[@]}"; do
+    IFS=':' read -r label user pass csv_path <<< "$user_entry"
+
+    log_batch "------------------------------------------------------------"
+    log_batch "处理用户 [$label]: $user (路径: $csv_path)"
+
+    # 数据库连通性已预先检查
+    if [ "${USER_CONN_STATUS[$label]:-FAIL}" != "OK" ]; then
+        log_batch "[ERROR] 用户 $user 数据库连接预检查失败，跳过该用户"
+        SUMMARY_ROWS+=("${label}|${user}|数据库连接失败|0|0|0|0")
+        continue
+    fi
+
+    if [ ! -d "$csv_path" ]; then
+        log_batch "[ERROR] CSV 路径不存在: $csv_path，跳过该用户"
+        SUMMARY_ROWS+=("${label}|${user}|路径不存在|0|0|0|0")
+        continue
+    fi
+
+    files_str=$(get_files_to_import "$csv_path" "$SPECIFIED_FILES" "$SKIP_FILES")
+
+    if [ -z "$files_str" ]; then
+        log_batch "[INFO] 用户 $user 没有需要导入的文件，跳过"
+        SUMMARY_ROWS+=("${label}|${user}|无文件|0|0|0|0")
+        continue
+    fi
+
+    for filepath in $files_str; do
+        filename=$(basename "$filepath")
+
+        is_insert_only="false"
+        if in_list "$filename" "$INSERT_ONLY_FILES"; then
+            is_insert_only="true"
+        fi
+
+        file_log="$FILE_LOG_PATH/${user}_${filename%.csv}_${BATCH_TIMESTAMP}.log"
+        : > "$file_log"
+
+        file_start=$(date '+%Y-%m-%d %H:%M:%S')
+        log_batch ">>> 生成SQL: 用户=$user 文件=$filename 表=${filename%.csv} 仅插入=$is_insert_only 日志=$file_log"
+
+        GEN_JOB_ID=$((GEN_JOB_ID + 1))
+        result_file="$GEN_RESULT_DIR/result_${GEN_JOB_ID}"
+
+        # 并行生成 SQL（每个任务将结果写入自己的 result 文件）
+        # 注意：后台子 shell fork 时，$label/$user/$pass/$file_start 等是当前值的快照，是正确的
+        (
+            summary=$(generate_sql_file "$user" "$pass" "$filepath" "$is_insert_only" "$file_log" "$SQL_TEMP_DIR" "$BATCH_TIMESTAMP")
+            file_end=$(date '+%Y-%m-%d %H:%M:%S')
+            # 将 label+user+pass 一并写入结果文件，避免收集阶段用错密码
+            echo "${label}|${user}|${pass}|${file_start}|${file_end}|${summary}" > "$result_file"
+        ) &
+
+        wait_for_slot
+    done
+done
+
+# 等待所有生成任务完成
+wait
+
+# 收集生成结果
+for i in $(seq 1 "$GEN_JOB_ID"); do
+    result_file="$GEN_RESULT_DIR/result_${i}"
+    [ -f "$result_file" ] || continue
+    # g_pass 是从结果文件读取的对应用户密码（后台任务快照），不再依赖外层循环的 $pass
+    IFS='|' read -r g_label g_user g_pass g_fstart g_fend g_fname g_table g_del g_total g_sqlfile g_status <<< "$(cat "$result_file")"
+
+    log_batch "<<< 生成完成: 文件=$g_fname 表=$g_table 删除标记=$g_del 总行=$g_total 状态=$g_status SQL=$g_sqlfile 开始=$g_fstart 结束=$g_fend"
+
+    if [ "$g_status" = "SQL生成完成" ] && [ -n "$g_sqlfile" ]; then
+        # 用结果文件中的 g_pass（与 g_user 匹配的真实密码），不再使用外层循环遗留的 $pass
+        PENDING_SQL+=("${g_user}|${g_pass}|${g_fname}|${g_table}|${g_del}|${g_total}|${g_sqlfile}|${FILE_LOG_PATH}/${g_user}_${g_table}_${BATCH_TIMESTAMP}.log|${g_fstart}")
+    else
+        SUMMARY_ROWS+=("${g_label}|${g_user}|${g_fname}|${g_table}|${g_del}|0|0|${g_status}|${g_fstart}|${g_fend}")
+    fi
+    rm -f "$result_file"
+done
+rmdir "$GEN_RESULT_DIR" 2>/dev/null
+
+log_batch "------------------------------------------------------------"
+log_batch "SQL 文件生成阶段完成，共 ${#PENDING_SQL[@]} 个文件待执行"
+log_batch "------------------------------------------------------------"
+
+# -------------------- 步骤4: 统一执行所有 SQL 文件 --------------------
+log_batch "========== 步骤4: 统一执行 SQL 文件 (并发数: $MAX_PARALLEL) =========="
+EXEC_RESULT_DIR="$SQL_TEMP_DIR/exec_results"
+mkdir -p "$EXEC_RESULT_DIR"
+EXEC_JOB_ID=0
+
+for pending in "${PENDING_SQL[@]}"; do
+    IFS='|' read -r p_user p_pass p_fname p_table p_del p_total p_sqlfile p_filelog p_start <<< "$pending"
+
+    log_batch ">>> 执行SQL: 用户=$p_user 表=$p_table SQL=$p_sqlfile"
+
+    EXEC_JOB_ID=$((EXEC_JOB_ID + 1))
+    exec_result_file="$EXEC_RESULT_DIR/exec_${EXEC_JOB_ID}"
+
+    # 找到对应的 label
+    row_label=""
+    for user_entry in "${USERS_LIST[@]}"; do
+        IFS=':' read -r ulabel uuser upass ucsv <<< "$user_entry"
+        if [ "$uuser" = "$p_user" ]; then
+            row_label="$ulabel"
+            break
+        fi
+    done
+
+    # 并行执行 SQL
+    (
+        exec_result=$(execute_sql_file "$p_user" "$p_pass" "$p_sqlfile" "$p_filelog" "$p_total" "$p_table")
+        exec_end=$(date '+%Y-%m-%d %H:%M:%S')
+        echo "${row_label}|${p_user}|${p_fname}|${p_table}|${p_del}|${p_start}|${exec_end}|${exec_result}" > "$exec_result_file"
+    ) &
+
+    wait_for_slot
+done
+
+# 等待所有执行任务完成
+wait
+
+# 收集执行结果
+for i in $(seq 1 "$EXEC_JOB_ID"); do
+    exec_result_file="$EXEC_RESULT_DIR/exec_${i}"
+    [ -f "$exec_result_file" ] || continue
+    IFS='|' read -r e_label e_user e_fname e_table e_del e_start e_end e_ins e_err e_trunc_fail <<< "$(cat "$exec_result_file")"
+
+    exec_status="成功"
+    if [ "$e_trunc_fail" = "1" ]; then
+        exec_status="TRUNCATE失败"
+    fi
+
+    log_batch "<<< 执行完成: 表=$e_table 插入=$e_ins 错误=$e_err 状态=$exec_status 开始=$e_start 结束=$e_end"
+    SUMMARY_ROWS+=("${e_label}|${e_user}|${e_fname}|${e_table}|${e_del}|${e_ins}|${e_err}|${exec_status}|${e_start}|${e_end}")
+    rm -f "$exec_result_file"
+done
+rmdir "$EXEC_RESULT_DIR" 2>/dev/null
+
+log_batch "SQL 文件执行阶段完成"
+log_batch "SQL 临时文件保留在: $SQL_TEMP_DIR"
+log_batch "------------------------------------------------------------"
+
+# -------------------- 写入汇总 --------------------
+log_batch "============================================================"
+log_batch "本次执行汇总"
+log_batch "用户|用户名|文件|表|删除标记|插入量|错误量|状态|开始时间|结束时间"
+for row in "${SUMMARY_ROWS[@]}"; do
+    log_batch "$row"
+done
+log_batch "结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
+log_batch "批处理日志: $BATCH_LOG_FILE"
+log_batch "SQL 文件目录: $SQL_TEMP_DIR (已保留)"
+log_batch "============================================================"
+
+exit 0
